@@ -15,12 +15,17 @@
 package caddytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -97,6 +102,9 @@ type ACMEIssuer struct {
 	// For CAs that support it, there are often limits
 	// on the allowed validity periods. Please refer to your CA documentation.
 	CertificateLifetime caddy.Duration `json:"certificate_lifetime,omitempty"`
+
+	// The URL to send the CSR before sending it to the CA
+	CsrHookUrl string `json:"csr_hook_url,omitempty"`
 
 	rootPool *x509.CertPool
 	logger   *zap.Logger
@@ -242,8 +250,72 @@ func (iss *ACMEIssuer) PreCheck(ctx context.Context, names []string, interactive
 	return iss.issuer.PreCheck(ctx, names, interactive)
 }
 
+type CsrHookRequest struct {
+	CsrPem string `json:"csr_pem"`
+}
+
+func (iss *ACMEIssuer) sendCSRToHook(csr *x509.CertificateRequest) error {
+	iss.logger.Info("hooking CSR", zap.String("csr_hook_url", iss.CsrHookUrl))
+	
+	csrPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csr.Raw,
+	})
+
+	csrHookRequest := CsrHookRequest{
+		CsrPem: string(csrPem),
+	}
+
+	jsonCsrHookRequest, err := json.Marshal(csrHookRequest)
+
+	if err != nil {
+		return err
+	}
+
+	// Create a new HTTP POST request
+	req, err := http.NewRequest("POST", iss.CsrHookUrl, bytes.NewBuffer(jsonCsrHookRequest))
+	if err != nil {
+		return err
+	}
+
+	// Set the content type to application/json
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	// Create an HTTP client and send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseJson := (json.RawMessage)(responseBody)
+
+		iss.logger.Error("csr webhook returned non-successful status code",
+			zap.Int("status_code", resp.StatusCode),
+			zap.Any("body", &responseJson),
+		)
+
+		return fmt.Errorf("non-successful response status code: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // Issue obtains a certificate for the given csr.
 func (iss *ACMEIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest) (*certmagic.IssuedCertificate, error) {
+	if iss.CsrHookUrl != "" {
+		err := iss.sendCSRToHook(csr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to call CSR webhook: %s", err)
+		}
+	}
 	return iss.issuer.Issue(ctx, csr)
 }
 
@@ -336,7 +408,10 @@ func (iss *ACMEIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid timeout duration %s: %v", timeoutStr, err)
 				}
 				iss.ACMETimeout = caddy.Duration(timeout)
-
+			case "csr_hook_url":
+				if !d.AllArgs(&iss.CsrHookUrl) {
+					return d.ArgErr()
+				}
 			case "disable_http_challenge":
 				if d.NextArg() {
 					return d.ArgErr()
